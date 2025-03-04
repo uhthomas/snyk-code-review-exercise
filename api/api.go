@@ -1,15 +1,20 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"sync"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/gorilla/mux"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
 func New() http.Handler {
@@ -112,15 +117,13 @@ func packageHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type dependencyResolver struct {
-	metaCache    map[string]*npmPackageMetaResponse
-	packageCache map[string]*npmPackageResponse
+	sem                     *semaphore.Weighted
+	singleflight            singleflight.Group
+	metaCache, packageCache sync.Map
 }
 
 func newDependencyResolver() *dependencyResolver {
-	return &dependencyResolver{
-		metaCache:    make(map[string]*npmPackageMetaResponse),
-		packageCache: make(map[string]*npmPackageResponse),
-	}
+	return &dependencyResolver{sem: semaphore.NewWeighted(10)}
 }
 
 // review: I like that this functionality has been moved into a function! It's
@@ -167,7 +170,7 @@ func newDependencyResolver() *dependencyResolver {
 // [https://pkg.go.dev/golang.org/x/sync/singleflight] and [sync.Mutex].
 // Complexity is my concern.
 func (r *dependencyResolver) resolveDependencies(pkg *NpmPackageVersion, versionConstraint string) error {
-	pkgMeta, err := r.fetchPackageMeta(pkg.Name)
+	pkgMeta, err := r.fetchPackageMetaSingleflight(pkg.Name)
 	if err != nil {
 		return err
 	}
@@ -181,10 +184,11 @@ func (r *dependencyResolver) resolveDependencies(pkg *NpmPackageVersion, version
 		return nil
 	}
 
-	npmPkg, err := r.fetchPackage(pkg.Name, pkg.Version)
+	npmPkg, err := r.fetchPackageSingleflight(pkg.Name, pkg.Version)
 	if err != nil {
 		return err
 	}
+	var g errgroup.Group
 	for dependencyName, dependencyVersionConstraint := range npmPkg.Dependencies {
 		dep := &NpmPackageVersion{
 			parent:       pkg,
@@ -192,11 +196,12 @@ func (r *dependencyResolver) resolveDependencies(pkg *NpmPackageVersion, version
 			Dependencies: map[string]*NpmPackageVersion{},
 		}
 		pkg.Dependencies[dependencyName] = dep
-		if err := r.resolveDependencies(dep, dependencyVersionConstraint); err != nil {
-			return err
-		}
+
+		g.Go(func() error {
+			return r.resolveDependencies(dep, dependencyVersionConstraint)
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 func highestCompatibleVersion(constraintStr string, versions *npmPackageMetaResponse) (string, error) {
@@ -226,11 +231,26 @@ func filterCompatibleVersions(constraint *semver.Constraints, pkgMeta *npmPackag
 	return compatible
 }
 
-func (r *dependencyResolver) fetchPackage(name, version string) (*npmPackageResponse, error) {
-	if v, ok := r.packageCache[name+version]; ok {
-		fmt.Printf("using cached package: %s@%s\n", name, version)
-		return v, nil
+func (r *dependencyResolver) fetchPackageSingleflight(name, version string) (*npmPackageResponse, error) {
+	v, err, _ := r.singleflight.Do("package/"+name+version, func() (interface{}, error) {
+		return r.fetchPackage(name, version)
+	})
+	if err != nil {
+		return nil, err
 	}
+	return v.(*npmPackageResponse), nil
+}
+
+func (r *dependencyResolver) fetchPackage(name, version string) (*npmPackageResponse, error) {
+	if v, ok := r.packageCache.Load(name + version); ok {
+		fmt.Printf("using cached package: %s@%s\n", name, version)
+		return v.(*npmPackageResponse), nil
+	}
+
+	if err := r.sem.Acquire(context.Background(), 1); err != nil {
+		return nil, err
+	}
+	defer r.sem.Release(1)
 
 	// idea: URL construction could be safer with [path.Join] and
 	// [net/url.URL.ResolveReference]. String templating is prone to all
@@ -267,19 +287,34 @@ func (r *dependencyResolver) fetchPackage(name, version string) (*npmPackageResp
 	var parsed npmPackageResponse
 	_ = json.Unmarshal(body, &parsed)
 
-	r.packageCache[name+version] = &parsed
+	r.packageCache.Store(name+version, &parsed)
 
 	return &parsed, nil
+}
+
+func (r *dependencyResolver) fetchPackageMetaSingleflight(p string) (*npmPackageMetaResponse, error) {
+	v, err, _ := r.singleflight.Do("package-meta/"+p, func() (interface{}, error) {
+		return r.fetchPackageMeta(p)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*npmPackageMetaResponse), nil
 }
 
 // idea: If the package is not found (404, I assume), we should return a
 // different error which the handler can use to differentiate between fatal and
 // non fatal.
 func (r *dependencyResolver) fetchPackageMeta(p string) (*npmPackageMetaResponse, error) {
-	if v, ok := r.metaCache[p]; ok {
+	if v, ok := r.metaCache.Load(p); ok {
 		fmt.Printf("using cached package meta: %s\n", p)
-		return v, nil
+		return v.(*npmPackageMetaResponse), nil
 	}
+
+	if err := r.sem.Acquire(context.Background(), 1); err != nil {
+		return nil, err
+	}
+	defer r.sem.Release(1)
 
 	resp, err := http.Get(fmt.Sprintf("https://registry.npmjs.org/%s", p))
 	if err != nil {
@@ -297,7 +332,7 @@ func (r *dependencyResolver) fetchPackageMeta(p string) (*npmPackageMetaResponse
 		return nil, err
 	}
 
-	r.metaCache[p] = &parsed
+	r.metaCache.Store(p, &parsed)
 
 	return &parsed, nil
 }
